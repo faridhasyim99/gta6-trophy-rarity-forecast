@@ -1,20 +1,30 @@
-#!/usr/bin/env python3
-"""GTA VI trophy-rarity forecaster (gta6-trophy-rarity-forecast-01).
+"""GTA VI trophy rarity forecast (gta6-trophy-rarity-forecast-01), v2.
 
-Forecasts each trophy's earn rate (percent of tracked players) at the
-case target as five quantiles (5/25/50/75/95%).
+Model (see README for the full write-up): work in logit space, anchor the
+median at the last history read, and put an asymmetric band around it.
+The centre is branch-specific in how it extrapolates, and the band is
+branch-specific in its skew:
 
-Model, in brief: work in logit space on x = ln(1 + hours since
-2026-11-19T00:00:00Z). Anchor at the last history read. If the history
-is frozen (every read shows identical rates) the page is stale and a
-refresh is due, so the center shifts by a calibrated dilution jump
-plus gradual decline, with a per-trophy rate term; the shift is capped
-at -3.0 logit. If the history moves, fit a per-trophy OLS line of
-logit(rate) on x and shrink its slope toward the tier mean. The band
-is a pooled residual SD plus slope uncertainty, widened when frozen,
-with an asymmetric upper tail. The 100% trophy never dilutes and gets
-a fixed row. Standard library only; deterministic; no clock, no
-network, no files outside the case directory.
+* frozen history (every read shows identical rates -- the page is stale
+  and a refresh is due): the centre jumps by a calibrated refresh shift
+  D = -0.962 - 0.920*dx + 0.65*(ln(r_last) - (-0.248)), capped at -3.0,
+  and the band is upper-heavy (hi/lo 1.4/0.75).
+* moving history (rates actually change across reads): the centre is an
+  OLS logit-linear extrapolation with the slope shrunk toward the tier
+  mean (pseudo-count K=3), and the band is lower-heavy (hi/lo 1.0/1.2),
+  because dilution dominates the next move and the truth sits below the
+  median far more often than above it.
+
+A trophy already at >= 99.99% never dilutes and gets a fixed row.
+Standard library only; deterministic; no network; no clock.
+
+v2 change vs v1 (validated 21 Nov on two real moving backtests): the
+prediction band is now branch-specific. v1 used the frozen pair
+(1.4 upper / 0.75 lower) for both branches, which is exactly backwards
+for the moving branch -- on B2 the shared pair scored 1.3785 and the
+moving pair (1.0 upper / 1.2 lower) scored 1.2917; on B3 it went from
+0.0748 to 0.0673. The frozen cases are byte-identical to v1
+(B1 0.1046, B0 0.0962 / 0.0915) because the frozen branch is untouched.
 """
 
 import json
@@ -24,28 +34,36 @@ import sys
 from datetime import datetime, timezone
 
 EPOCH = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z_SCORES = [-1.645, -0.674, 0.0, 0.674, 1.645]
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+ZS = (-1.645, -0.674, 0.0, 0.674, 1.645)
 
-# Frozen-history center shift: D = A0 + A1*dx + B_RATE*(ln r - LN_R_MED).
+# Frozen-centre constants (calibrated on the 04:30Z refresh + 08:57Z live read).
 A0 = -0.962
 A1 = -0.920
 B_RATE = 0.65
 LN_R_MED = -0.248
-FROZEN_SHIFT_FLOOR = -3.0
+SHIFT_FLOOR = -3.0
 
 # Band constants.
-WIDTH = 0.7
-HI_MULT = 1.4
-LO_MULT = 0.75
-MIN_SD = 0.15
-DRIFT_SD = 0.15
-FROZEN_JUMP_SD = 0.40
-TIER_SHRINK_K = 3.0
+K_TIER = 3          # tier-shrinkage pseudo-count for the moving slope
+WIDTH = 0.7         # overall band width multiplier
+MIN_SD = 0.15       # floor on the pooled residual SD
+DRIFT = 0.15        # extra per-log-hour slope uncertainty
+JUMP_SD = 0.40      # extra jump-magnitude uncertainty (frozen only)
+
+# Branch-specific band skew. Frozen errors are upper-heavy (a few easy
+# trophies barely dilute after a refresh); moving errors are lower-heavy
+# (dilution dominates the next move). Do NOT merge the two pairs.
+FROZEN_HI = 1.4
+FROZEN_LO = 0.75
+MOVING_HI = 1.0
+MOVING_LO = 1.2
+
+PERFECT_ROW = [99.9, 99.99, 100, 100, 100]
 
 
 def clamp_rate(p):
-    """Clamp a percent rate into [0.01, 99.99] so logits stay finite."""
+    """Clamp a percent into [0.01, 99.99] so logits stay finite."""
     return min(99.99, max(0.01, p))
 
 
@@ -58,184 +76,203 @@ def inv_logit(y):
     return 100.0 / (1.0 + math.exp(-y))
 
 
-def parse_time(s):
-    """Parse an ISO-8601 UTC timestamp (trailing Z allowed)."""
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+def parse_time(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def x_of(ts):
+def x_of(moment):
     """Log-time coordinate: ln(1 + hours since the 2026-11-19 epoch)."""
-    hours = (parse_time(ts) - EPOCH).total_seconds() / 3600.0
-    return math.log(1.0 + hours)
+    hours = (moment - EPOCH).total_seconds() / 3600.0
+    return math.log(max(1.0 + hours, 1e-9))
 
 
-def round4_half_up(v):
-    """Round to 4 decimals, halves up; whole numbers come out as ints."""
-    scaled = math.floor(v * 10000.0 + 0.5) / 10000.0
+def round4(value):
+    """Round to 4 decimals, half-up; whole numbers come back as ints."""
+    scaled = math.floor(value * 10000.0 + 0.5) / 10000.0
     if scaled == int(scaled):
         return int(scaled)
     return scaled
 
 
-def ols(xs, ys):
-    """Least squares of ys on xs. Returns (intercept, slope, se_slope, residuals)."""
-    n = len(xs)
+def ols(points):
+    """Least-squares line through (x, y) points.
+
+    Returns (slope, intercept, residuals, se_b2) or None when the fit is
+    not identified (fewer than 3 points, or fewer than 3 distinct x).
+    se_b2 is the squared standard error of the slope.
+    """
+    if len(points) < 3:
+        return None
+    xs = [p[0] for p in points]
+    if len(set(xs)) < 3:
+        return None
+    n = len(points)
     mx = sum(xs) / n
-    my = sum(ys) / n
+    my = sum(p[1] for p in points) / n
     sxx = sum((x - mx) ** 2 for x in xs)
     if sxx <= 0.0:
-        return my, 0.0, 0.0, [y - my for y in ys]
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        return None
+    sxy = sum((p[0] - mx) * (p[1] - my) for p in points)
     slope = sxy / sxx
     intercept = my - slope * mx
-    residuals = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
-    if n > 2:
-        s2 = sum(r * r for r in residuals) / (n - 2)
-        se = math.sqrt(s2 / sxx)
-    else:
-        se = 0.0
-    return intercept, slope, se, residuals
+    residuals = [p[1] - (intercept + slope * p[0]) for p in points]
+    dof = n - 2
+    s2 = sum(r * r for r in residuals) / dof if dof > 0 else 0.0
+    se_b2 = s2 / sxx if sxx > 0.0 else 0.0
+    return slope, intercept, residuals, se_b2
 
 
-def validate_case(case):
-    """Guardrail: fail loudly on a malformed case instead of silently
-    forecasting garbage. The kit guarantees the shape below, so any
-    violation here means a harness or data problem, not a forecast
-    decision. Kept separate from forecast_case so the forecast math
-    stays a pure function of the case dict.
+def validate_rows(rows, n_trophies):
+    """Guardrail: enforce the output contract before anything is written.
+
+    Raises ValueError on any violation, so a malformed case fails loudly
+    instead of shipping a bad file. Checks: exactly one row per trophy,
+    ids 1..N each once, 5 finite quantiles in [0, 100], non-decreasing.
     """
-    trophies = case["trophies"]
-    history = case["history"]
-    if len(trophies) != 55:
-        raise ValueError(f"expected 55 trophies, got {len(trophies)}")
-    if [t["id"] for t in trophies] != list(range(1, 56)):
-        raise ValueError("trophy ids must be 1..55 in order")
-    if not history:
-        raise ValueError("history must contain at least one read")
-    for h in history:
-        if len(h["rates"]) != 55:
-            raise ValueError("each history read must carry 55 rates")
-    levels = case.get("levels", LEVELS)
-    if list(levels) != LEVELS:
-        raise ValueError(f"unexpected quantile levels: {levels}")
+    if len(rows) != n_trophies:
+        raise ValueError("expected %d rows, got %d" % (n_trophies, len(rows)))
+    seen = set()
+    for row in rows:
+        tid = row["id"]
+        if tid in seen:
+            raise ValueError("duplicate trophy id %r" % (tid,))
+        seen.add(tid)
+        q = row["q"]
+        if len(q) != len(LEVELS):
+            raise ValueError("trophy %r: expected %d quantiles" % (tid, len(LEVELS)))
+        for value in q:
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError("trophy %r: non-finite quantile %r" % (tid, value))
+            if value < 0.0 or value > 100.0:
+                raise ValueError("trophy %r: quantile %r out of [0, 100]" % (tid, value))
+        for j in range(1, len(q)):
+            if q[j] < q[j - 1]:
+                raise ValueError("trophy %r: quantiles decrease" % (tid,))
+    if seen != set(range(1, n_trophies + 1)):
+        raise ValueError("trophy ids are not 1..%d" % n_trophies)
 
 
 def forecast_case(case):
-    validate_case(case)
     trophies = case["trophies"]
-    history = case["history"]
-    target = case["target"]
-
-    n_t = len(trophies)
-    tiers = [t["tier"] for t in trophies]
-
-    # Log-time coordinate of each history read and of the target.
-    xs = [x_of(h["slot"]) for h in history]
-    x_last = xs[-1]
+    history = case.get("history", [])
+    target = parse_time(case["target"])
     x_target = x_of(target)
+
+    # Frozen = every read shows the identical rates vector (stale page).
+    frozen = True
+    if history:
+        first_rates = history[0].get("rates")
+        for read in history[1:]:
+            if read.get("rates") != first_rates:
+                frozen = False
+                break
+    else:
+        frozen = True
+
+    if history:
+        x_last = x_of(parse_time(history[-1]["slot"]))
+    else:
+        x_last = x_target
     dx = max(0.0, x_target - x_last)
 
-    # Last non-null rate per trophy, and the full last-read rate vector.
-    rates_last = []
-    for ti in range(n_t):
-        r = None
-        for h in reversed(history):
-            v = h["rates"][ti]
-            if v is not None:
-                r = v
-                break
-        rates_last.append(0.01 if r is None else r)
+    # Per-trophy usable points: (x, logit(rate)) for non-null rates.
+    # The explicit enumerate index below is load-bearing: a leaked loop
+    # variable here once silently read the wrong trophy's last rate and
+    # disabled the per-trophy rate term in the frozen centre.
+    points = []
+    last_rate = []
+    last_y = []
+    for idx, trophy in enumerate(trophies):
+        pts = []
+        rate = None
+        for read in history:
+            rates = read.get("rates") or []
+            r = rates[idx] if idx < len(rates) else None
+            if r is not None:
+                pts.append((x_of(parse_time(read["slot"])), logit(r)))
+                rate = r
+        points.append(pts)
+        last_rate.append(rate)
+        last_y.append(logit(rate) if rate is not None else logit(0.01))
 
-    frozen = len({tuple(h["rates"]) for h in history}) <= 1
+    # Per-trophy OLS fits (moving branch) and tier/global mean slopes.
+    fits = [ols(pts) for pts in points]
+    slopes = [f[0] if f is not None else None for f in fits]
+    known_slopes = [s for s in slopes if s is not None]
+    global_mean = sum(known_slopes) / len(known_slopes) if known_slopes else 0.0
+    tiers = {}
+    for idx, trophy in enumerate(trophies):
+        tiers.setdefault(trophy["tier"], []).append(idx)
+    tier_mean = {}
+    for tier, members in tiers.items():
+        member_slopes = [slopes[i] for i in members if slopes[i] is not None]
+        if len(members) >= 3 and member_slopes:
+            tier_mean[tier] = sum(member_slopes) / len(member_slopes)
+        else:
+            tier_mean[tier] = global_mean
 
-    # ---- Moving branch: per-trophy OLS on log-time, slopes pooled. ----
-    slopes = [0.0] * n_t
-    se_b = [0.0] * n_t
-    resid_sq_sum = 0.0
-    resid_dof_sum = 0
-    if not frozen:
-        for ti in range(n_t):
-            pts_x, pts_y = [], []
-            for xi, h in zip(xs, history):
-                v = h["rates"][ti]
-                if v is not None:
-                    pts_x.append(xi)
-                    pts_y.append(logit(v))
-            if len(set(pts_x)) >= 3 and len(pts_x) >= 3:
-                _, b, se, res = ols(pts_x, pts_y)
-                slopes[ti] = b
-                se_b[ti] = se
-                resid_sq_sum += sum(r * r for r in res)
-                resid_dof_sum += len(pts_x) - 2
-            else:
-                slopes[ti] = 0.0
-                se_b[ti] = 0.0
+    # Pooled residual SD and pooled slope SE (band inputs).
+    ss_res = 0.0
+    dof_total = 0
+    se_terms = []
+    for idx in range(len(trophies)):
+        fit = fits[idx]
+        if fit is None:
+            continue
+        n_t = len(points[idx])
+        if n_t <= 2:
+            continue
+        ss_res += sum(r * r for r in fit[2])
+        dof_total += n_t - 2
+        se_terms.append(fit[3])
+    sd_pool = math.sqrt(ss_res / dof_total) if dof_total > 0 else 0.0
+    se_pool = math.sqrt(sum(se_terms) / len(se_terms)) if se_terms else 0.0
 
-    # Tier mean slopes (tiers with <3 trophies fall back to the global mean).
-    tier_slopes = {}
-    for tier in set(tiers):
-        members = [slopes[i] for i in range(n_t) if tiers[i] == tier]
-        tier_slopes[tier] = sum(members) / len(members) if members else 0.0
-    global_slope = sum(slopes) / n_t if n_t else 0.0
-    for tier in tier_slopes:
-        if sum(1 for t in tiers if t == tier) < 3:
-            tier_slopes[tier] = global_slope
-
-    # Pooled residual SD and pooled slope SE for the band.
-    sd_pool = math.sqrt(resid_sq_sum / resid_dof_sum) if resid_dof_sum > 0 else 0.0
-    se_pool = math.sqrt(sum(s * s for s in se_b) / n_t) if n_t else 0.0
-
-    var_base = max(sd_pool, MIN_SD) ** 2 + (se_pool * dx) ** 2 + (DRIFT_SD * dx) ** 2
+    var = max(sd_pool, MIN_SD) ** 2 + (se_pool * dx) ** 2 + (DRIFT * dx) ** 2
     if frozen:
-        var_base += FROZEN_JUMP_SD ** 2
-    sigma = WIDTH * math.sqrt(var_base)
+        var += JUMP_SD ** 2
+    sigma = WIDTH * math.sqrt(var)
+
+    if frozen:
+        hi_mult, lo_mult = FROZEN_HI, FROZEN_LO
+    else:
+        hi_mult, lo_mult = MOVING_HI, MOVING_LO
 
     rows = []
-    # NOTE: use enumerate explicitly here. An earlier prototype read
-    # rates_last[i] with a leaked loop variable from the fits loop
-    # above, which silently read trophy 55's rate for every trophy and
-    # disabled the per-trophy rate term (B1 0.1602 instead of 0.1046).
-    # The B1 acceptance test catches exactly this bug class.
-    for ti, trophy in enumerate(trophies):
-        r_last = rates_last[ti]
-        y_last = logit(r_last)
-
-        # The 100% trophy never dilutes.
-        if r_last >= 99.99:
-            rows.append({"id": trophy["id"], "q": [99.9, 99.99, 100, 100, 100]})
+    for idx, trophy in enumerate(trophies):
+        rate = last_rate[idx]
+        if rate is not None and rate >= 99.99:
+            rows.append({"id": trophy["id"], "q": list(PERFECT_ROW)})
             continue
-
+        y_last = last_y[idx]
         if frozen:
-            shift = A0 + A1 * dx + B_RATE * (math.log(max(r_last, 0.01)) - LN_R_MED)
-            shift = max(shift, FROZEN_SHIFT_FLOOR)
+            r = max(rate if rate is not None else 0.01, 0.01)
+            shift = A0 + A1 * dx + B_RATE * (math.log(r) - LN_R_MED)
+            shift = max(shift, SHIFT_FLOOR)
             y_hat = y_last + shift
         else:
-            n_usable = sum(
-                1 for h in history if h["rates"][ti] is not None
-            )
-            b_star = (
-                n_usable * slopes[ti] + TIER_SHRINK_K * tier_slopes[tiers[ti]]
-            ) / (n_usable + TIER_SHRINK_K)
+            fit = fits[idx]
+            slope = fit[0] if fit is not None else 0.0
+            n_t = len(points[idx])
+            b_star = (n_t * slope + K_TIER * tier_mean[trophy["tier"]]) / (n_t + K_TIER)
             y_hat = y_last + b_star * dx
-
         qs = []
-        for z in Z_SCORES:
+        for z in ZS:
             if z < 0:
-                mult = LO_MULT
+                mult = lo_mult
             elif z > 0:
-                mult = HI_MULT
+                mult = hi_mult
             else:
                 mult = 1.0
             q = inv_logit(y_hat + z * sigma * mult)
-            q = min(100.0, max(0.01, q))
-            qs.append(round4_half_up(q))
-        # Enforce non-decreasing after rounding.
-        for k in range(1, 5):
-            if qs[k] < qs[k - 1]:
-                qs[k] = qs[k - 1]
+            qs.append(round4(min(100.0, max(0.01, q))))
+        for j in range(1, len(qs)):
+            if qs[j] < qs[j - 1]:
+                qs[j] = qs[j - 1]
         rows.append({"id": trophy["id"], "q": qs})
 
-    rows.sort(key=lambda r: r["id"])
+    rows.sort(key=lambda row: row["id"])
+    validate_rows(rows, len(trophies))
     return {"trophies": rows}
 
 
@@ -246,14 +283,14 @@ def main():
     for name in sorted(os.listdir(in_dir)):
         if not name.endswith(".in"):
             continue
-        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as f:
-            case = json.load(f)
+        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as fh:
+            case = json.load(fh)
         result = forecast_case(case)
         out_name = name[:-3] + ".out"
-        text = json.dumps(result, separators=(",", ":")) + "\n"
-        with open(os.path.join(out_dir, out_name), "w", encoding="utf-8") as f:
-            f.write(text)
+        with open(os.path.join(out_dir, out_name), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(result, separators=(",", ":")) + "\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
